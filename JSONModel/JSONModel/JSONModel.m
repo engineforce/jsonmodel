@@ -550,6 +550,7 @@ static JSONKeyMapper* globalKeyMapper = nil;
             //get property name
             objc_property_t property = properties[i];
             const char *propertyName = property_getName(property);
+            
             p.name = @(propertyName);
 
             //JMLog(@"property: %@", p.name);
@@ -576,8 +577,10 @@ static JSONKeyMapper* globalKeyMapper = nil;
             [scanner scanUpToString:@"T" intoString: nil];
             [scanner scanString:@"T" intoString:nil];
 
-            //check if the property is an instance of a class
-            if ([scanner scanString:@"@\"" intoString: &propertyType]) {
+            p.isOptional = YES;
+            
+            //check if the property is object or id
+            if ([scanner scanString:@"@\"" intoString: &propertyType] || [scanner scanString:@"@," intoString: &propertyType]) {
 
                 [scanner scanUpToCharactersFromSet:[NSCharacterSet characterSetWithCharactersInString:@"\"<"]
                                         intoString:&propertyType];
@@ -585,8 +588,8 @@ static JSONKeyMapper* globalKeyMapper = nil;
                 //JMLog(@"type: %@", propertyClassName);
                 p.type = NSClassFromString(propertyType);
                 p.isMutable = ([propertyType rangeOfString:@"Mutable"].location != NSNotFound);
-                p.isStandardJSONType = [allowedJSONTypes containsObject:p.type];
-
+                p.isStandardJSONType = [allowedJSONTypes containsObject:p.type];                
+                
                 //read through the property protocols
                 while ([scanner scanString:@"<" intoString:NULL]) {
 
@@ -739,7 +742,17 @@ static JSONKeyMapper* globalKeyMapper = nil;
     }
 
     //if the protocol is actually a JSONModel class
-    if ([self __isJSONModelSubClass:protocolClass]) {
+    BOOL isJsonModel =[self __isJSONModelSubClass:protocolClass];
+    SEL selFromJsonModel = NSSelectorFromString(@"fromJsonModel:");
+    BOOL hasCustomConverter = [protocolClass respondsToSelector:selFromJsonModel];
+    id (*func)(id, SEL, id) = nil;
+    
+    if (hasCustomConverter) {
+        IMP imp = [protocolClass methodForSelector:selFromJsonModel];
+        func = (void *)imp;
+    }
+    
+    if (isJsonModel || hasCustomConverter) {
 
         //check if it's a list of models
         if ([property.type isSubclassOfClass:[NSArray class]]) {
@@ -756,13 +769,24 @@ static JSONKeyMapper* globalKeyMapper = nil;
                 return nil;
             }
 
-            //one shot conversion
-            JSONModelError* arrayErr = nil;
-            value = [[protocolClass class] arrayOfModelsFromDictionaries:value error:&arrayErr];
-            if((err != nil) && (arrayErr != nil))
-            {
-                *err = [arrayErr errorByPrependingKeyPathComponent:property.name];
-                return nil;
+            if (hasCustomConverter) {
+                NSMutableArray *newValue = [NSMutableArray arrayWithArray:value];
+                
+                for(int i = 0; i < [newValue count]; ++i) {
+                    newValue[i] = func(protocolClass, selFromJsonModel, newValue[i]);
+                }
+                
+                value = [NSArray arrayWithArray:newValue];
+            }
+            else {
+                //one shot conversion
+                JSONModelError* arrayErr = nil;
+                value = [[protocolClass class] arrayOfModelsFromDictionaries:value error:&arrayErr];
+                if((err != nil) && (arrayErr != nil))
+                {
+                    *err = [arrayErr errorByPrependingKeyPathComponent:property.name];
+                    return nil;
+                }
             }
         }
 
@@ -783,21 +807,31 @@ static JSONKeyMapper* globalKeyMapper = nil;
 
             NSMutableDictionary* res = [NSMutableDictionary dictionary];
 
-            for (NSString* key in [value allKeys]) {
-                JSONModelError* initErr = nil;
-                id obj = [[[protocolClass class] alloc] initWithDictionary:value[key] error:&initErr];
-                if (obj == nil)
-                {
-                    // Propagate the error, including the property name as the key-path component
-                    if((err != nil) && (initErr != nil))
-                    {
-                        initErr = [initErr errorByPrependingKeyPathComponent:key];
-                        *err = [initErr errorByPrependingKeyPathComponent:property.name];
-                    }
-                    return nil;
+            if(hasCustomConverter) {
+                for (NSString* key in [value allKeys]) {
+                    id innerValue = value[key];
+                    innerValue = func(protocolClass, selFromJsonModel, innerValue);
+                    [res setValue:innerValue forKey:key];
                 }
-                [res setValue:obj forKey:key];
             }
+            else {
+                for (NSString* key in [value allKeys]) {
+                    JSONModelError* initErr = nil;
+                    id obj = [[[protocolClass class] alloc] initWithDictionary:value[key] error:&initErr];
+                    if (obj == nil)
+                    {
+                        // Propagate the error, including the property name as the key-path component
+                        if((err != nil) && (initErr != nil))
+                        {
+                            initErr = [initErr errorByPrependingKeyPathComponent:key];
+                            *err = [initErr errorByPrependingKeyPathComponent:property.name];
+                        }
+                        return nil;
+                    }
+                    [res setValue:obj forKey:key];
+                }
+            }
+            
             value = [NSDictionary dictionaryWithDictionary:res];
         }
     }
